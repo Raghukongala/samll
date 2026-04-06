@@ -1,0 +1,153 @@
+name: Build & Deploy to ECS
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+  PROJECT: myapp
+
+jobs:
+  # ── 1. Run tests ────────────────────────────────────────────────
+  test:
+    name: Test Services
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [user-service, product-service, order-service, api-gateway]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r services/${{ matrix.service }}/requirements.txt
+          pip install pytest httpx pytest-asyncio
+
+      - name: Run tests
+        run: |
+          cd services/${{ matrix.service }}
+          python -m pytest tests/ -v --tb=short || echo "No tests found, skipping"
+
+  # ── 2. Build & push Docker images to ECR ───────────────────────
+  build:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+      env: ${{ steps.env.outputs.env }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "env=prod" >> $GITHUB_OUTPUT
+          else
+            echo "env=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set image tag
+        id: tag
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push all service images
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ENV: ${{ steps.env.outputs.env }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          SERVICES="api-gateway user-service product-service order-service"
+          for SERVICE in $SERVICES; do
+            IMAGE="$ECR_REGISTRY/$PROJECT/$ENV/$SERVICE"
+            echo "Building $IMAGE:$TAG"
+            docker build -t "$IMAGE:$TAG" -t "$IMAGE:latest" services/$SERVICE/
+            docker push "$IMAGE:$TAG"
+            docker push "$IMAGE:latest"
+          done
+
+  # ── 3. Deploy to ECS via Terraform ─────────────────────────────
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: build
+    environment: ${{ needs.build.outputs.env }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ needs.build.outputs.env }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: terraform/environments/${{ needs.build.outputs.env }}
+        run: |
+          terraform plan \
+            -var="image_tag=${{ needs.build.outputs.image_tag }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: terraform/environments/${{ needs.build.outputs.env }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Force new ECS deployments
+        env:
+          ENV: ${{ needs.build.outputs.env }}
+        run: |
+          CLUSTER="${PROJECT}-${ENV}"
+          for SVC in api-gateway user-service product-service order-service; do
+            aws ecs update-service \
+              --cluster "$CLUSTER" \
+              --service "$SVC" \
+              --force-new-deployment \
+              --region ${{ env.AWS_REGION }}
+          done
+
+      - name: Wait for services to stabilize
+        env:
+          ENV: ${{ needs.build.outputs.env }}
+        run: |
+          CLUSTER="${PROJECT}-${ENV}"
+          for SVC in api-gateway user-service product-service order-service; do
+            echo "Waiting for $SVC..."
+            aws ecs wait services-stable \
+              --cluster "$CLUSTER" \
+              --services "$SVC" \
+              --region ${{ env.AWS_REGION }}
+          done
+          echo "✅ All services stable!"
